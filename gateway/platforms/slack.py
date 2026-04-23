@@ -2393,18 +2393,10 @@ class SlackAdapter(BasePlatformAdapter):
             target_found = False
             cursor = ""
 
-            for _ in range(max_pages):
+            async def _call_replies(**kwargs):
                 result = None
                 for attempt in range(3):
                     try:
-                        kwargs = {
-                            "channel": channel_id,
-                            "ts": thread_ts,
-                            "limit": limit + 1,
-                            "inclusive": True,
-                        }
-                        if cursor:
-                            kwargs["cursor"] = cursor
                         result = await client.conversations_replies(**kwargs)
                         break
                     except Exception as exc:
@@ -2423,14 +2415,87 @@ class SlackAdapter(BasePlatformAdapter):
                             await asyncio.sleep(retry_after)
                             continue
                         raise
+                return result
 
-                if result is None:
-                    return ""
+            if target_ts != thread_ts:
+                target_result = await _call_replies(
+                    channel=channel_id,
+                    ts=thread_ts,
+                    oldest=target_ts,
+                    latest=target_ts,
+                    limit=1,
+                    inclusive=True,
+                )
+                target_messages = (target_result or {}).get("messages", [])
+                if any((msg.get("ts", "") == target_ts) for msg in target_messages):
+                    window_result = await _call_replies(
+                        channel=channel_id,
+                        ts=thread_ts,
+                        latest=target_ts,
+                        limit=limit + 1,
+                        inclusive=True,
+                    )
+                    window_messages = (window_result or {}).get("messages", [])
+                    if window_messages:
+                        messages = window_messages
+                    else:
+                        messages = target_messages
+                else:
+                    messages = []
+            else:
+                messages = []
 
-                messages = result.get("messages", [])
-                if not messages:
-                    break
+            if not messages:
+                for _ in range(max_pages):
+                    kwargs = {
+                        "channel": channel_id,
+                        "ts": thread_ts,
+                        "limit": limit + 1,
+                        "inclusive": True,
+                    }
+                    if cursor:
+                        kwargs["cursor"] = cursor
+                    result = await _call_replies(**kwargs)
+                    if result is None:
+                        return ""
 
+                    messages = result.get("messages", [])
+                    if not messages:
+                        break
+
+                    for msg in messages:
+                        if msg.get("bot_id") or msg.get("subtype") == "bot_message":
+                            continue
+
+                        msg_text = msg.get("text", "").strip()
+                        if not msg_text:
+                            continue
+                        if bot_uid:
+                            msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+                            if not msg_text:
+                                continue
+
+                        msg_ts = msg.get("ts", "")
+                        name = await self._resolve_user_name(msg.get("user", "unknown"), chat_id=channel_id)
+                        if msg_ts == thread_ts:
+                            thread_parent_line = f"[linked thread parent] {name}: {msg_text}"
+                        else:
+                            prefix = "[linked target] " if msg_ts == target_ts else ""
+                            recent_lines.append(f"{prefix}{name}: {msg_text}")
+                            if len(recent_lines) > limit:
+                                recent_lines = recent_lines[-limit:]
+
+                        if msg_ts == target_ts:
+                            target_found = True
+                            break
+
+                    if target_found:
+                        break
+
+                    cursor = ((result.get("response_metadata") or {}).get("next_cursor") or "").strip()
+                    if not cursor:
+                        break
+            else:
                 for msg in messages:
                     if msg.get("bot_id") or msg.get("subtype") == "bot_message":
                         continue
@@ -2456,13 +2521,6 @@ class SlackAdapter(BasePlatformAdapter):
                     if msg_ts == target_ts:
                         target_found = True
                         break
-
-                if target_found:
-                    break
-
-                cursor = ((result.get("response_metadata") or {}).get("next_cursor") or "").strip()
-                if not cursor:
-                    break
 
             if not target_found:
                 return ""

@@ -561,18 +561,60 @@ class TestSlackPermalinkContext:
         assert "[linked target] Bob: Target deployment comment" in context
         assert "Bot note to skip" not in context
         assert "Later reply after target" not in context
-        mock_client.conversations_replies.assert_called_once_with(
-            channel="C0ASPQAE6HL",
-            ts="1776864367.902269",
-            limit=16,
-            inclusive=True,
+        assert mock_client.conversations_replies.await_count == 2
+        first_call = mock_client.conversations_replies.await_args_list[0].kwargs
+        second_call = mock_client.conversations_replies.await_args_list[1].kwargs
+        assert first_call["oldest"] == "1776913222.573359"
+        assert first_call["latest"] == "1776913222.573359"
+        assert second_call["latest"] == "1776913222.573359"
+
+    @pytest.mark.asyncio
+    async def test_permalink_context_uses_direct_target_lookup_before_paginating(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(side_effect=[
+            {
+                "messages": [
+                    {"ts": "1776922542.696259", "user": "U2", "text": "Target deployment comment"},
+                ]
+            },
+            {
+                "messages": [
+                    {"ts": "1776864367.902269", "user": "U1", "text": "Root issue summary"},
+                    {"ts": "1776922542.696259", "user": "U2", "text": "Target deployment comment"},
+                ]
+            },
+        ])
+        adapter._resolve_user_name = AsyncMock(
+            side_effect=lambda user_id, chat_id="": {
+                "U1": "Alice",
+                "U2": "Bob",
+            }.get(user_id, user_id)
         )
+
+        context = await adapter._fetch_permalink_context(
+            "https://workspace.slack.com/archives/C0ASPQAE6HL/"
+            "p1776922542696259?thread_ts=1776864367.902269&cid=C0ASPQAE6HL",
+            team_id="T1",
+        )
+
+        assert "[linked thread parent] Alice: Root issue summary" in context
+        assert "[linked target] Bob: Target deployment comment" in context
+        first_call = mock_client.conversations_replies.await_args_list[0].kwargs
+        second_call = mock_client.conversations_replies.await_args_list[1].kwargs
+        assert first_call["oldest"] == "1776922542.696259"
+        assert first_call["latest"] == "1776922542.696259"
+        assert second_call["latest"] == "1776922542.696259"
 
     @pytest.mark.asyncio
     async def test_permalink_context_paginates_until_target_reply_is_found(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.conversations_replies = AsyncMock(side_effect=[
+            {
+                "messages": [],
+                "response_metadata": {"next_cursor": ""},
+            },
             {
                 "messages": [
                     {"ts": "1776864367.902269", "user": "U1", "text": "Root issue summary"},
@@ -605,9 +647,13 @@ class TestSlackPermalinkContext:
 
         assert "[linked thread parent] Alice: Root issue summary" in context
         assert "[linked target] Carol: Target deployment comment" in context
-        assert mock_client.conversations_replies.await_count == 2
+        assert mock_client.conversations_replies.await_count == 3
+        first_call = mock_client.conversations_replies.await_args_list[0].kwargs
         second_call = mock_client.conversations_replies.await_args_list[1].kwargs
-        assert second_call["cursor"] == "cursor-2"
+        third_call = mock_client.conversations_replies.await_args_list[2].kwargs
+        assert first_call["oldest"] == "1776913222.573359"
+        assert second_call.get("cursor") is None
+        assert third_call["cursor"] == "cursor-2"
 
     @pytest.mark.asyncio
     async def test_handle_slack_message_injects_permalink_context_into_dm_message(self):
