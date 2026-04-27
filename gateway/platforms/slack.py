@@ -537,6 +537,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
             _apply_slack_proxy(self._handler.client, proxy_url)
             self._socket_mode_task = asyncio.create_task(self._handler.start_async())
+            asyncio.create_task(self._monitor_socket_mode())
 
             self._running = True
             logger.info(
@@ -551,6 +552,36 @@ class SlackAdapter(BasePlatformAdapter):
         finally:
             if lock_acquired and not self._running:
                 self._release_platform_lock()
+
+
+    async def _monitor_socket_mode(self) -> None:
+        """Watch the socket-mode background task and report fatal error on crash.
+
+        slack_bolt's AsyncSocketModeHandler.start_async() runs forever while
+        the WebSocket is healthy.  If the connection drops and internal
+        reconnect fails, the task ends silently — leaving _running=True while
+        no messages can be received.  This monitor detects that and triggers
+        the gateway's reconnect-watcher instead of letting the gateway hang
+        until the next health-guard restart.
+        """
+        task = self._socket_mode_task
+        if task is None:
+            return
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error("[Slack] Socket Mode task crashed: %s", exc, exc_info=True)
+        if not self._running:
+            return
+        logger.warning("[Slack] Socket Mode task ended unexpectedly — triggering reconnect")
+        self._set_fatal_error(
+            "socket_mode_disconnected",
+            "Socket Mode connection lost",
+            retryable=True,
+        )
+        await self._notify_fatal_error()
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""

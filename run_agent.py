@@ -6200,7 +6200,11 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
-            if not has_retried_429:
+            # With multiple pooled credentials, rotate on the first rate-limit
+            # classification so the next account takes over immediately. The
+            # double-429 retry only applies when a single credential is configured
+            # (avoids flapping when there is no alternate key).
+            if len(pool.entries()) <= 1 and not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)

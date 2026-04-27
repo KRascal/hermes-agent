@@ -89,8 +89,8 @@ async def test_runner_queues_retryable_runtime_fatal_for_reconnection(monkeypatc
 
     await runner._handle_adapter_fatal_error(adapter)
 
-    # Should shut down with failure — systemd Restart=on-failure will restart
-    runner.stop.assert_awaited_once()
-    assert runner._exit_with_failure is True
+    # Should stay alive and let the background reconnect watcher recover.
+    runner.stop.assert_not_awaited()
+    assert runner._exit_with_failure is False
     assert Platform.WHATSAPP in runner._failed_platforms
     assert runner._failed_platforms[Platform.WHATSAPP]["attempts"] == 0

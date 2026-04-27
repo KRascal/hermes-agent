@@ -844,6 +844,7 @@ class GatewayRunner:
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        self._runtime_status_heartbeat_interval = 30.0
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -1422,22 +1423,15 @@ class GatewayRunner:
                 logger.error("No connected messaging platforms remain. Shutting down gateway cleanly.")
             await self.stop()
         elif not self.adapters and self._failed_platforms:
-            # All platforms are down and queued for background reconnection.
-            # If the error is retryable, exit with failure so systemd Restart=on-failure
-            # can restart the process. Otherwise stay alive and keep retrying in background.
-            if adapter.fatal_error_retryable:
-                self._exit_reason = adapter.fatal_error_message or "All messaging platforms failed with retryable errors"
-                self._exit_with_failure = True
-                logger.error(
-                    "All messaging platforms failed with retryable errors. "
-                    "Shutting down gateway for service restart (systemd will retry)."
-                )
-                await self.stop()
-            else:
-                logger.warning(
-                    "No connected messaging platforms remain, but %d platform(s) queued for reconnection",
-                    len(self._failed_platforms),
-                )
+            # All platforms are down but at least one is queued for background
+            # reconnection. Keep the gateway process alive so active agents,
+            # cron scheduling, and the reconnect watcher are not torn down by a
+            # transient Socket Mode/WebSocket disconnect on a single-platform
+            # deployment.
+            logger.warning(
+                "No connected messaging platforms remain, but %d platform(s) queued for reconnection; keeping gateway alive",
+                len(self._failed_platforms),
+            )
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
@@ -1540,6 +1534,20 @@ class GatewayRunner:
             )
         except Exception:
             pass
+
+    async def _runtime_status_heartbeat(self, interval: Optional[float] = None) -> None:
+        interval_seconds = interval if interval is not None else self._runtime_status_heartbeat_interval
+        try:
+            interval_seconds = max(1.0, float(interval_seconds))
+        except (TypeError, ValueError):
+            interval_seconds = 30.0
+
+        while self._running:
+            self._update_runtime_status("running")
+            try:
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                break
 
     def _update_platform_runtime_status(
         self,
@@ -2740,6 +2748,10 @@ class GatewayRunner:
                 ", ".join(p.value for p in self._failed_platforms),
             )
         asyncio.create_task(self._platform_reconnect_watcher())
+
+        heartbeat_task = asyncio.create_task(self._runtime_status_heartbeat())
+        self._background_tasks.add(heartbeat_task)
+        heartbeat_task.add_done_callback(self._background_tasks.discard)
 
         logger.info("Press Ctrl+C to stop")
         
