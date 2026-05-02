@@ -35,6 +35,7 @@ import logging
 import os
 import platform
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -69,6 +70,107 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUE_VALUES
+
+
+def _systemd_code_properties() -> list[str]:
+    """Build resource isolation props for execute_code transient units."""
+    props: list[str] = []
+    mapping = {
+        "HERMES_LOCAL_SYSTEMD_MEMORY_HIGH": "MemoryHigh",
+        "HERMES_LOCAL_SYSTEMD_MEMORY_MAX": "MemoryMax",
+        "HERMES_LOCAL_SYSTEMD_CPU_QUOTA": "CPUQuota",
+        "HERMES_LOCAL_SYSTEMD_CPU_WEIGHT": "CPUWeight",
+        "HERMES_LOCAL_SYSTEMD_IO_WEIGHT": "IOWeight",
+    }
+    for env_name, prop_name in mapping.items():
+        value = os.getenv(env_name, "").strip()
+        if value:
+            props.extend(["-p", f"{prop_name}={value}"])
+    return props
+
+
+def _write_systemd_env_file(env: dict) -> str:
+    from tools.environments.local import _write_systemd_env_file as _write_env_file
+
+    return _write_env_file(env)
+
+
+def _cleanup_systemd_env_file(proc) -> None:
+    path = getattr(proc, "_hermes_systemd_env_file", None)
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        delattr(proc, "_hermes_systemd_env_file")
+    except Exception:
+        pass
+
+
+def _spawn_code_child(args: list[str], *, cwd: str, env: dict) -> subprocess.Popen:
+    """Spawn execute_code's Python child, optionally isolated from gateway cgroup."""
+    if (
+        not _IS_WINDOWS
+        and _env_truthy("HERMES_LOCAL_SYSTEMD_RUN")
+        and shutil.which("systemd-run")
+        and shutil.which("sudo")
+    ):
+        unit = f"hermes-code-{os.getpid()}-{uuid.uuid4().hex[:12]}.service"
+        env_file = _write_systemd_env_file(env)
+        popen_env = {
+            "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+            "HOME": os.environ.get("HOME", "/"),
+            "USER": os.environ.get("USER", ""),
+            "LOGNAME": os.environ.get("LOGNAME", ""),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        proc = subprocess.Popen(
+            [
+                "sudo",
+                "-n",
+                "systemd-run",
+                "--quiet",
+                "--collect",
+                "--wait",
+                "--pipe",
+                f"--unit={unit}",
+                f"--uid={os.getuid()}",
+                f"--gid={os.getgid()}",
+                "-p",
+                f"WorkingDirectory={cwd}",
+                "-p",
+                f"EnvironmentFile={env_file}",
+                *_systemd_code_properties(),
+                *args,
+            ],
+            cwd="/",
+            env=popen_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            preexec_fn=None if _IS_WINDOWS else os.setsid,
+        )
+        proc._hermes_systemd_unit = unit
+        proc._hermes_systemd_env_file = env_file
+        return proc
+
+    return subprocess.Popen(
+        args,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        preexec_fn=None if _IS_WINDOWS else os.setsid,
+    )
 
 
 def check_sandbox_requirements() -> bool:
@@ -995,6 +1097,7 @@ def execute_code(
     tool_call_counter = [0]  # mutable so the RPC thread can increment
     exec_start = time.monotonic()
     server_sock = None
+    proc = None
 
     try:
         # Write the auto-generated hermes_tools module
@@ -1091,14 +1194,10 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir)
         _script_path = os.path.join(tmpdir, "script.py")
 
-        proc = subprocess.Popen(
+        proc = _spawn_code_child(
             [_child_python, _script_path],
             cwd=_child_cwd,
             env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
@@ -1302,6 +1401,11 @@ def execute_code(
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
         try:
+            if proc is not None:
+                _cleanup_systemd_env_file(proc)
+        except Exception:
+            pass
+        try:
             os.unlink(sock_path)
         except OSError:
             pass  # already cleaned up or never created
@@ -1310,6 +1414,19 @@ def execute_code(
 def _kill_process_group(proc, escalate: bool = False):
     """Kill the child and its entire process group."""
     try:
+        unit = getattr(proc, "_hermes_systemd_unit", None)
+        if unit and not _IS_WINDOWS:
+            for sig in (["SIGTERM", "SIGKILL"] if escalate else ["SIGTERM"]):
+                try:
+                    subprocess.run(
+                        ["sudo", "-n", "systemctl", "kill", "--kill-whom=all", f"--signal={sig}", unit],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                        check=False,
+                    )
+                except Exception as e:
+                    logger.debug("Could not signal execute_code systemd unit %s: %s", unit, e, exc_info=True)
         if _IS_WINDOWS:
             proc.terminate()
         else:

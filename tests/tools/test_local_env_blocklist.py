@@ -16,7 +16,7 @@ from tools.environments.local import (
     LocalEnvironment,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
-    _systemd_run_env_args,
+    _systemd_env_file_lines,
 )
 
 
@@ -333,22 +333,24 @@ class TestSanePathIncludesHomebrew:
 
 
 class TestSystemdRunIsolation:
-    def test_systemd_env_args_filter_invalid_and_runtime_vars(self):
-        args = _systemd_run_env_args({
+    def test_systemd_env_file_lines_filter_invalid_and_runtime_vars(self):
+        lines = _systemd_env_file_lines({
             "PATH": "/usr/bin",
             "GOOD_VAR": "ok",
+            "SPACE_VAR": "hello world",
             "1BAD": "drop",
             "BAD-NAME": "drop",
             "JOURNAL_STREAM": "drop",
             "MULTILINE": "a\nb",
         })
 
-        assert "--setenv=PATH=/usr/bin" in args
-        assert "--setenv=GOOD_VAR=ok" in args
-        assert not any("1BAD" in item for item in args)
-        assert not any("BAD-NAME" in item for item in args)
-        assert not any("JOURNAL_STREAM" in item for item in args)
-        assert not any("MULTILINE" in item for item in args)
+        assert "PATH=/usr/bin" in lines
+        assert "GOOD_VAR=ok" in lines
+        assert "SPACE_VAR='hello world'" in lines
+        assert not any("1BAD" in item for item in lines)
+        assert not any("BAD-NAME" in item for item in lines)
+        assert not any("JOURNAL_STREAM" in item for item in lines)
+        assert not any("MULTILINE" in item for item in lines)
 
     def test_opt_in_systemd_run_wraps_local_foreground_command(self):
         captured = {}
@@ -383,6 +385,7 @@ class TestSystemdRunIsolation:
              patch("tools.environments.local.os.getgid", return_value=1000), \
              patch("tools.environments.local.os.getpid", return_value=999), \
              patch("tools.environments.local.os.getpgid", return_value=12345), \
+             patch("tools.environments.local._write_systemd_env_file", return_value="/tmp/hermes-test.env"), \
              patch("subprocess.Popen", side_effect=fake_popen):
             env = LocalEnvironment(cwd="/tmp", timeout=10)
             proc = env._run_bash("echo hello")
@@ -394,8 +397,9 @@ class TestSystemdRunIsolation:
         assert "--gid=1000" in cmd
         assert any(item.startswith("--unit=hermes-tool-999-") for item in cmd)
         assert "-p" in cmd
+        assert "EnvironmentFile=/tmp/hermes-test.env" in cmd
         assert "MemoryMax=3500M" in cmd
-        assert "--setenv=PATH=/usr/bin:/bin" in cmd
+        assert not any(item.startswith("--setenv=") for item in cmd)
         assert not any("OPENAI_API_KEY" in item for item in cmd)
         assert captured["cwd"] == "/"
         assert captured["env"]["PATH"] == "/usr/bin:/bin"

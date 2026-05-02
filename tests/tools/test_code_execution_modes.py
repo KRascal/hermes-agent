@@ -17,7 +17,7 @@ import os
 import sys
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -38,6 +38,7 @@ from tools.code_execution_tool import (
     _is_usable_python,
     _resolve_child_cwd,
     _resolve_child_python,
+    _spawn_code_child,
     build_execute_code_schema,
     execute_code,
 )
@@ -449,6 +450,55 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertIn("execute_code_available: False", result["output"])
         self.assertIn("delegate_task_available: False", result["output"])
+
+
+class TestSystemdRunCodeIsolation(unittest.TestCase):
+    def test_opt_in_systemd_run_wraps_execute_code_child_without_secret_argv(self):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            captured["cwd"] = kwargs.get("cwd")
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.stdout = MagicMock()
+            proc.stderr = MagicMock()
+            return proc
+
+        system_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "USER": "testuser",
+            "LOGNAME": "testuser",
+            "HERMES_LOCAL_SYSTEMD_RUN": "1",
+            "HERMES_LOCAL_SYSTEMD_MEMORY_MAX": "3500M",
+            "OPENAI_API_KEY": "must-not-reach-argv",
+        }
+
+        with patch.dict(os.environ, system_env, clear=True), \
+             patch("tools.code_execution_tool.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+             patch("tools.code_execution_tool.os.getuid", return_value=1000), \
+             patch("tools.code_execution_tool.os.getgid", return_value=1000), \
+             patch("tools.code_execution_tool.os.getpid", return_value=999), \
+             patch("tools.code_execution_tool._write_systemd_env_file", return_value="/tmp/hermes-code-test.env"), \
+             patch("tools.code_execution_tool.subprocess.Popen", side_effect=fake_popen):
+            proc = _spawn_code_child([sys.executable, "/tmp/script.py"], cwd="/tmp", env=system_env)
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[:6], ["sudo", "-n", "systemd-run", "--quiet", "--collect", "--wait"])
+        self.assertIn("--pipe", cmd)
+        self.assertIn("--uid=1000", cmd)
+        self.assertIn("--gid=1000", cmd)
+        self.assertTrue(any(item.startswith("--unit=hermes-code-999-") for item in cmd))
+        self.assertIn("EnvironmentFile=/tmp/hermes-code-test.env", cmd)
+        self.assertIn("MemoryMax=3500M", cmd)
+        self.assertFalse(any(item.startswith("--setenv=") for item in cmd))
+        self.assertFalse(any("OPENAI_API_KEY" in item or "must-not-reach-argv" in item for item in cmd))
+        self.assertEqual(captured["cwd"], "/")
+        self.assertEqual(captured["env"]["PATH"], "/usr/bin:/bin")
+        self.assertTrue(getattr(proc, "_hermes_systemd_unit").startswith("hermes-code-999-"))
+        self.assertEqual(getattr(proc, "_hermes_systemd_env_file"), "/tmp/hermes-code-test.env")
 
 
 if __name__ == "__main__":

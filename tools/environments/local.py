@@ -5,6 +5,7 @@ import platform
 import shutil
 import signal
 import subprocess
+import shlex
 import tempfile
 import time
 import uuid
@@ -213,21 +214,42 @@ def _valid_systemd_env_name(name: str) -> bool:
     return all(ch.isalnum() or ch == "_" for ch in name)
 
 
-def _systemd_run_env_args(run_env: dict) -> list[str]:
-    """Return --setenv args safe for systemd-run transient services."""
-    args: list[str] = []
+def _systemd_env_file_lines(run_env: dict) -> list[str]:
+    """Return EnvironmentFile assignments safe for systemd transient services."""
+    lines: list[str] = []
     for raw_key, value in sorted((run_env or {}).items()):
         key = str(raw_key)
         if not _valid_systemd_env_name(key):
             continue
         value = str(value)
-        # systemd environment assignments are single-line NAME=VALUE strings.
+        # systemd EnvironmentFile assignments are single-line NAME=VALUE entries.
         if "\x00" in value or "\n" in value or "\r" in value:
             continue
         if len(key) + len(value) > 8192:
             continue
-        args.append(f"--setenv={key}={value}")
-    return args
+        lines.append(f"{key}={shlex.quote(value)}")
+    return lines
+
+
+def _write_systemd_env_file(run_env: dict) -> str:
+    """Write command env to a chmod-0600 file to avoid leaking secrets in argv."""
+    fd, path = tempfile.mkstemp(prefix="hermes-systemd-env-", suffix=".env")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(_systemd_env_file_lines(run_env)))
+            f.write("\n")
+        os.chmod(path, 0o600)
+        return path
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 def _systemd_run_properties() -> list[str]:
@@ -418,6 +440,7 @@ class LocalEnvironment(BaseEnvironment):
         run_env = _make_run_env(self.env)
 
         systemd_unit = None
+        systemd_env_file = None
         popen_env = run_env
         popen_cwd = self.cwd
         popen_args = args
@@ -431,8 +454,11 @@ class LocalEnvironment(BaseEnvironment):
             # cgroup.  Running each foreground terminal command as a transient
             # service keeps build/test/Node/Chromium spikes from OOM-killing the
             # Slack gateway itself.  The feature is opt-in because non-systemd
-            # desktops and CI should keep the direct Popen path.
+            # desktops and CI should keep the direct Popen path.  The child env
+            # is passed via EnvironmentFile so API keys never appear in argv or
+            # sudo/journal command logs.
             systemd_unit = f"hermes-tool-{os.getpid()}-{uuid.uuid4().hex[:12]}.service"
+            systemd_env_file = _write_systemd_env_file(run_env)
             popen_args = [
                 "sudo",
                 "-n",
@@ -446,12 +472,13 @@ class LocalEnvironment(BaseEnvironment):
                 f"--gid={os.getgid()}",
                 "-p",
                 f"WorkingDirectory={self.cwd}",
+                "-p",
+                f"EnvironmentFile={systemd_env_file}",
                 *_systemd_run_properties(),
-                *_systemd_run_env_args(run_env),
                 *args,
             ]
             # The transient unit receives the sanitized command environment via
-            # --setenv.  Keep only enough env for sudo/systemd-run itself.
+            # EnvironmentFile.  Keep only enough env for sudo/systemd-run itself.
             popen_env = {
                 "PATH": os.environ.get("PATH", _SANE_PATH),
                 "HOME": os.environ.get("HOME", "/"),
@@ -475,6 +502,8 @@ class LocalEnvironment(BaseEnvironment):
         )
         if systemd_unit:
             proc._hermes_systemd_unit = systemd_unit
+        if systemd_env_file:
+            proc._hermes_systemd_env_file = systemd_env_file
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -485,6 +514,26 @@ class LocalEnvironment(BaseEnvironment):
             _pipe_stdin(proc, stdin_data)
 
         return proc
+
+    @staticmethod
+    def _cleanup_systemd_env_file(proc) -> None:
+        path = getattr(proc, "_hermes_systemd_env_file", None)
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        try:
+            delattr(proc, "_hermes_systemd_env_file")
+        except Exception:
+            pass
+
+    def _wait_for_process(self, proc, timeout: int = 120) -> dict:
+        try:
+            return super()._wait_for_process(proc, timeout=timeout)
+        finally:
+            self._cleanup_systemd_env_file(proc)
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
@@ -590,6 +639,8 @@ class LocalEnvironment(BaseEnvironment):
                 proc.kill()
             except Exception:
                 pass
+        finally:
+            self._cleanup_systemd_env_file(proc)
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed)."""
