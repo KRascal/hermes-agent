@@ -139,8 +139,11 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs["extra_headers"] = merged_extra_headers
 
         max_tokens = params.get("max_tokens")
+        # chatgpt.com/backend-api/codex rejects ``max_output_tokens`` (HTTP 400
+        # Unsupported parameter).  GitHub/xAI and other Responses endpoints may
+        # still accept it when the caller supplies an explicit cap.
         if max_tokens is not None and not is_codex_backend:
-            kwargs["max_output_tokens"] = max_tokens
+            kwargs["max_output_tokens"] = int(max_tokens)
 
         if is_xai_responses and session_id:
             kwargs["extra_headers"] = {"x-grok-conv-id": session_id}

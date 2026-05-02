@@ -8256,13 +8256,16 @@ class AIAgent:
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
             _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
+            _ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
+            if _ephemeral_out is not None:
+                self._ephemeral_max_output_tokens = None
             return _ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
                 tools=self.tools,
                 reasoning_config=self.reasoning_config,
                 session_id=getattr(self, "session_id", None),
-                max_tokens=self.max_tokens,
+                max_tokens=_ephemeral_out if _ephemeral_out is not None else self.max_tokens,
                 request_overrides=self.request_overrides,
                 is_github_responses=is_github_responses,
                 is_codex_backend=is_codex_backend,
@@ -11317,7 +11320,7 @@ class AIAgent:
                                 "error": _exhaust_error,
                             }
 
-                        if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages"):
+                        if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages", "codex_responses"):
                             assistant_message = _trunc_msg
                             if assistant_message is not None and not _trunc_has_tool_calls:
                                 length_continue_retries += 1
@@ -11357,7 +11360,7 @@ class AIAgent:
                                     "error": "Response remained truncated after 3 continuation attempts",
                                 }
 
-                        if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages"):
+                        if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages", "codex_responses"):
                             assistant_message = _trunc_msg
                             if assistant_message is not None and _trunc_has_tool_calls:
                                 if truncated_tool_call_retries < 1:
