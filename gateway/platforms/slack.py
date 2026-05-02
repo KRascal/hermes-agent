@@ -263,6 +263,56 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+def _slack_web_api_timeout_secs() -> int:
+    """Bound HTTP timeout for Slack Web API calls via ``slack_sdk.AsyncWebClient``.
+
+    Slack's default is **30 seconds**. Under host-wide load (many agent subprocesses /
+    compilers sharing the gateway's event loop budget), TLS + DNS resolution can spill
+    past that ceiling and ``chat.postMessage`` fails with ``TimeoutError`` while
+    Socket Mode may still appear *connected*.
+    Override with ``HERMES_SLACK_WEB_API_TIMEOUT`` (integer seconds).
+    """
+    raw = os.getenv("HERMES_SLACK_WEB_API_TIMEOUT", "").strip()
+    default = 120
+    if not raw:
+        return default
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        logger.warning(
+            "[Slack] Ignoring invalid HERMES_SLACK_WEB_API_TIMEOUT=%r; using %ds",
+            raw,
+            default,
+        )
+        return default
+    return max(10, min(value, 600))
+
+
+def _new_slack_web_client(token: str, *, timeout: int) -> AsyncWebClient:
+    """Create a Slack Web API client with bounded timeout.
+
+    Some tests and downstream shims provide a minimal ``AsyncWebClient`` stub that
+    does not accept newer constructor kwargs. Fall back only for that compatibility
+    case; real slack_sdk clients keep the explicit timeout.
+    """
+    try:
+        return AsyncWebClient(token=token, timeout=timeout)
+    except TypeError as exc:
+        if "timeout" not in str(exc):
+            raise
+        return AsyncWebClient(token=token)
+
+
+def _new_slack_app(*, token: str, client: AsyncWebClient) -> AsyncApp:
+    """Create Bolt app without duplicate-token warnings when supported."""
+    try:
+        return AsyncApp(client=client)
+    except TypeError as exc:
+        if "client" not in str(exc):
+            raise
+        return AsyncApp(token=token)
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -426,12 +476,19 @@ class SlackAdapter(BasePlatformAdapter):
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
-            self._app = AsyncApp(token=primary_token)
+            api_timeout = _slack_web_api_timeout_secs()
+            logger.info("[Slack] Web API HTTP timeout=%ss", api_timeout)
+
+            primary_client = _new_slack_web_client(primary_token, timeout=api_timeout)
+            _apply_slack_proxy(primary_client, proxy_url)
+            # Prefer client-only construction (token is baked into the client — avoids
+            # Bolt's "token will be unused" warning). Fall back for minimal test shims.
+            self._app = _new_slack_app(token=primary_token, client=primary_client)
             _apply_slack_proxy(self._app.client, proxy_url)
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
-                client = AsyncWebClient(token=token)
+                client = _new_slack_web_client(token, timeout=api_timeout)
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
