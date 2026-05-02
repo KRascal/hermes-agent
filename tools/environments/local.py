@@ -7,6 +7,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import uuid
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 
@@ -187,6 +188,64 @@ _SANE_PATH = (
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_SYSTEMD_ENV_BLOCKLIST = {
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "MAINPID",
+    "MANAGERPID",
+    "NOTIFY_SOCKET",
+    "SERVICE_RESULT",
+}
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUE_VALUES
+
+
+def _valid_systemd_env_name(name: str) -> bool:
+    if not name or name in _SYSTEMD_ENV_BLOCKLIST:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    return all(ch.isalnum() or ch == "_" for ch in name)
+
+
+def _systemd_run_env_args(run_env: dict) -> list[str]:
+    """Return --setenv args safe for systemd-run transient services."""
+    args: list[str] = []
+    for raw_key, value in sorted((run_env or {}).items()):
+        key = str(raw_key)
+        if not _valid_systemd_env_name(key):
+            continue
+        value = str(value)
+        # systemd environment assignments are single-line NAME=VALUE strings.
+        if "\x00" in value or "\n" in value or "\r" in value:
+            continue
+        if len(key) + len(value) > 8192:
+            continue
+        args.append(f"--setenv={key}={value}")
+    return args
+
+
+def _systemd_run_properties() -> list[str]:
+    """Build resource-isolation properties for local terminal transient units."""
+    props: list[str] = []
+    mapping = {
+        "HERMES_LOCAL_SYSTEMD_MEMORY_HIGH": "MemoryHigh",
+        "HERMES_LOCAL_SYSTEMD_MEMORY_MAX": "MemoryMax",
+        "HERMES_LOCAL_SYSTEMD_CPU_QUOTA": "CPUQuota",
+        "HERMES_LOCAL_SYSTEMD_CPU_WEIGHT": "CPUWeight",
+        "HERMES_LOCAL_SYSTEMD_IO_WEIGHT": "IOWeight",
+    }
+    for env_name, prop_name in mapping.items():
+        value = os.getenv(env_name, "").strip()
+        if value:
+            props.extend(["-p", f"{prop_name}={value}"])
+    return props
+
 
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
@@ -358,18 +417,64 @@ class LocalEnvironment(BaseEnvironment):
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
+        systemd_unit = None
+        popen_env = run_env
+        popen_cwd = self.cwd
+        popen_args = args
+        if (
+            not _IS_WINDOWS
+            and _env_truthy("HERMES_LOCAL_SYSTEMD_RUN")
+            and shutil.which("systemd-run")
+            and shutil.which("sudo")
+        ):
+            # Gateway-launched local tools normally stay in hermes-gateway.service's
+            # cgroup.  Running each foreground terminal command as a transient
+            # service keeps build/test/Node/Chromium spikes from OOM-killing the
+            # Slack gateway itself.  The feature is opt-in because non-systemd
+            # desktops and CI should keep the direct Popen path.
+            systemd_unit = f"hermes-tool-{os.getpid()}-{uuid.uuid4().hex[:12]}.service"
+            popen_args = [
+                "sudo",
+                "-n",
+                "systemd-run",
+                "--quiet",
+                "--collect",
+                "--wait",
+                "--pipe",
+                f"--unit={systemd_unit}",
+                f"--uid={os.getuid()}",
+                f"--gid={os.getgid()}",
+                "-p",
+                f"WorkingDirectory={self.cwd}",
+                *_systemd_run_properties(),
+                *_systemd_run_env_args(run_env),
+                *args,
+            ]
+            # The transient unit receives the sanitized command environment via
+            # --setenv.  Keep only enough env for sudo/systemd-run itself.
+            popen_env = {
+                "PATH": os.environ.get("PATH", _SANE_PATH),
+                "HOME": os.environ.get("HOME", "/"),
+                "USER": os.environ.get("USER", ""),
+                "LOGNAME": os.environ.get("LOGNAME", ""),
+                "LANG": os.environ.get("LANG", "C.UTF-8"),
+            }
+            popen_cwd = "/"
+
         proc = subprocess.Popen(
-            args,
+            popen_args,
             text=True,
-            env=run_env,
+            env=popen_env,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=self.cwd,
+            cwd=popen_cwd,
         )
+        if systemd_unit:
+            proc._hermes_systemd_unit = systemd_unit
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -413,10 +518,44 @@ class LocalEnvironment(BaseEnvironment):
                 pass
             return not _group_alive(pgid)
 
+        def _stop_systemd_unit(signal_name: str = "SIGTERM") -> None:
+            unit = getattr(proc, "_hermes_systemd_unit", None)
+            if not unit:
+                return
+            try:
+                subprocess.run(
+                    [
+                        "sudo",
+                        "-n",
+                        "systemctl",
+                        "kill",
+                        "--kill-whom=all",
+                        f"--signal={signal_name}",
+                        unit,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    ["sudo", "-n", "systemctl", "stop", unit],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                )
+            except Exception:
+                pass
+
         try:
             if _IS_WINDOWS:
                 proc.terminate()
             else:
+                _stop_systemd_unit("SIGTERM")
                 try:
                     pgid = os.getpgid(proc.pid)
                 except ProcessLookupError:
@@ -435,6 +574,7 @@ class LocalEnvironment(BaseEnvironment):
                 if _wait_for_group_exit(pgid, 1.0):
                     return
 
+                _stop_systemd_unit("SIGKILL")
                 try:
                     # POSIX-only: _IS_WINDOWS is handled by the outer branch.
                     os.killpg(pgid, signal.SIGKILL)

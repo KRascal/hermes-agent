@@ -16,6 +16,7 @@ from tools.environments.local import (
     LocalEnvironment,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
+    _systemd_run_env_args,
 )
 
 
@@ -328,3 +329,74 @@ class TestSanePathIncludesHomebrew:
             result = _make_run_env({})
         # Should keep existing PATH unchanged
         assert result["PATH"] == "/usr/bin:/bin"
+
+
+
+class TestSystemdRunIsolation:
+    def test_systemd_env_args_filter_invalid_and_runtime_vars(self):
+        args = _systemd_run_env_args({
+            "PATH": "/usr/bin",
+            "GOOD_VAR": "ok",
+            "1BAD": "drop",
+            "BAD-NAME": "drop",
+            "JOURNAL_STREAM": "drop",
+            "MULTILINE": "a\nb",
+        })
+
+        assert "--setenv=PATH=/usr/bin" in args
+        assert "--setenv=GOOD_VAR=ok" in args
+        assert not any("1BAD" in item for item in args)
+        assert not any("BAD-NAME" in item for item in args)
+        assert not any("JOURNAL_STREAM" in item for item in args)
+        assert not any("MULTILINE" in item for item in args)
+
+    def test_opt_in_systemd_run_wraps_local_foreground_command(self):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            captured["cwd"] = kwargs.get("cwd")
+            proc = MagicMock()
+            proc.pid = 12345
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            proc.stdout = MagicMock()
+            proc.stdin = MagicMock()
+            return proc
+
+        system_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "USER": "testuser",
+            "LOGNAME": "testuser",
+            "HERMES_LOCAL_SYSTEMD_RUN": "1",
+            "HERMES_LOCAL_SYSTEMD_MEMORY_MAX": "3500M",
+            "OPENAI_API_KEY": "must-not-reach-child",
+        }
+
+        with patch.dict(os.environ, system_env, clear=True), \
+             patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None), \
+             patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
+             patch("tools.environments.local.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+             patch("tools.environments.local.os.getuid", return_value=1000), \
+             patch("tools.environments.local.os.getgid", return_value=1000), \
+             patch("tools.environments.local.os.getpid", return_value=999), \
+             patch("tools.environments.local.os.getpgid", return_value=12345), \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            env = LocalEnvironment(cwd="/tmp", timeout=10)
+            proc = env._run_bash("echo hello")
+
+        cmd = captured["cmd"]
+        assert cmd[:6] == ["sudo", "-n", "systemd-run", "--quiet", "--collect", "--wait"]
+        assert "--pipe" in cmd
+        assert "--uid=1000" in cmd
+        assert "--gid=1000" in cmd
+        assert any(item.startswith("--unit=hermes-tool-999-") for item in cmd)
+        assert "-p" in cmd
+        assert "MemoryMax=3500M" in cmd
+        assert "--setenv=PATH=/usr/bin:/bin" in cmd
+        assert not any("OPENAI_API_KEY" in item for item in cmd)
+        assert captured["cwd"] == "/"
+        assert captured["env"]["PATH"] == "/usr/bin:/bin"
+        assert getattr(proc, "_hermes_systemd_unit").startswith("hermes-tool-999-")
