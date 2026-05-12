@@ -45,6 +45,7 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    _kill_process_group,
 )
 
 
@@ -357,6 +358,28 @@ raise RuntimeError("deliberate crash")
         # surfaces it to the user (#10807).
         self.assertIn("timed out", result.get("output", ""))
         self.assertIn("\u23f0", result.get("output", ""))
+
+    def test_kill_process_group_stops_systemd_unit(self):
+        """execute_code timeout cleanup kills transient systemd units."""
+        calls = []
+
+        def fake_kill(unit, *, escalate=False):
+            calls.append((unit, escalate))
+
+        class FakeProc:
+            pid = 999999999
+            _hermes_systemd_unit = "hermes-code-test.service"
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("tools.environments.local._kill_systemd_unit", side_effect=fake_kill):
+            _kill_process_group(FakeProc(), escalate=True)
+
+        self.assertEqual(calls, [("hermes-code-test.service", True)])
 
     def test_web_search_tool(self):
         """Script calls web_search and processes results."""

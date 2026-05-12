@@ -9,6 +9,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -43,6 +44,142 @@ def _resolve_safe_cwd(cwd: str) -> str:
             break
         parent = next_parent
     return tempfile.gettempdir()
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _local_systemd_run_enabled() -> bool:
+    """Return whether local foreground work should run in a transient unit.
+
+    This is intentionally opt-in.  Systemd isolation is primarily for Linux
+    gateways running as long-lived system services; the direct Popen path stays
+    the default for CLI/local development and non-systemd hosts.
+    """
+    if _IS_WINDOWS or not _truthy_env("HERMES_LOCAL_SYSTEMD_RUN"):
+        return False
+    return bool(shutil.which("systemd-run") and shutil.which("sudo") and shutil.which("systemctl"))
+
+
+def _systemd_env_quote(value: str) -> str:
+    """Quote one value for a systemd EnvironmentFile line."""
+    # Environment variables cannot contain NUL.  Newlines are legal in POSIX
+    # env but unsafe in EnvironmentFile syntax; represent them as escaped text
+    # instead of letting a value create extra directives.
+    value = str(value).replace("\x00", "").replace("\r", "\\r").replace("\n", "\\n")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _write_systemd_env_file(env: dict[str, str] | None) -> str:
+    """Write subprocess env to a private temp file for systemd-run."""
+    try:
+        from hermes_constants import get_hermes_home
+        env_dir = get_hermes_home() / "cache" / "systemd-run-env"
+    except Exception:
+        env_dir = Path(tempfile.gettempdir()) / "hermes-systemd-run-env"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    path = env_dir / f"env-{os.getpid()}-{uuid.uuid4().hex}.conf"
+    lines = []
+    for key, value in (env or {}).items():
+        if not key or "=" in key or "\x00" in key:
+            continue
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(key)):
+            continue
+        lines.append(f"{key}={_systemd_env_quote(str(value))}\n")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    return str(path)
+
+
+def _cleanup_systemd_run_proc(proc) -> None:
+    env_file = getattr(proc, "_hermes_systemd_env_file", None)
+    if env_file:
+        try:
+            os.unlink(env_file)
+        except OSError:
+            pass
+        try:
+            proc._hermes_systemd_env_file = None
+        except Exception:
+            pass
+
+
+def _kill_systemd_unit(unit: str | None, *, escalate: bool = False) -> None:
+    """Best-effort cleanup for a transient systemd service and its cgroup."""
+    if not unit or not shutil.which("systemctl"):
+        return
+    base = ["sudo", "-n", "systemctl"] if shutil.which("sudo") else ["systemctl"]
+    commands = [base + ["kill", "--kill-whom=all", unit]]
+    if escalate:
+        commands.append(base + ["kill", "--kill-whom=all", "--signal=SIGKILL", unit])
+    commands.append(base + ["stop", unit])
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+
+
+def _popen_maybe_systemd_run(
+    args: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str] | None,
+    unit_prefix: str = "hermes-tool",
+    **popen_kwargs,
+) -> subprocess.Popen:
+    """Spawn directly, or via a transient systemd service when opted in.
+
+    The systemd path keeps heavy terminal/code-execution children out of the
+    gateway service cgroup.  Environment is passed via a private
+    EnvironmentFile so API keys do not appear in argv/journal command lines.
+    """
+    if not _local_systemd_run_enabled():
+        return subprocess.Popen(args, cwd=cwd, env=env, **popen_kwargs)
+
+    env_file = _write_systemd_env_file(env)
+    unit = f"{unit_prefix}-{os.getpid()}-{uuid.uuid4().hex[:12]}.service"
+    cmd = [
+        "sudo", "-n", "systemd-run",
+        "--collect",
+        "--wait",
+        "--pipe",
+        "--quiet",
+        f"--unit={unit}",
+        f"--uid={os.getuid()}",
+        f"--gid={os.getgid()}",
+        f"--property=WorkingDirectory={cwd}",
+        f"--property=EnvironmentFile={env_file}",
+    ]
+    for env_name, prop_name in (
+        ("HERMES_LOCAL_SYSTEMD_MEMORY_HIGH", "MemoryHigh"),
+        ("HERMES_LOCAL_SYSTEMD_MEMORY_MAX", "MemoryMax"),
+        ("HERMES_LOCAL_SYSTEMD_CPU_WEIGHT", "CPUWeight"),
+        ("HERMES_LOCAL_SYSTEMD_IO_WEIGHT", "IOWeight"),
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            cmd.append(f"--property={prop_name}={value}")
+    cmd.append("--")
+    cmd.extend(args)
+
+    kwargs = dict(popen_kwargs)
+    # systemd owns the cgroup/process tree.  A separate setsid for the
+    # systemd-run wrapper is unnecessary and can make signal handling noisy.
+    kwargs.pop("preexec_fn", None)
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=None, **kwargs)
+    except Exception:
+        try:
+            os.unlink(env_file)
+        except OSError:
+            pass
+        raise
+    proc._hermes_systemd_unit = unit
+    proc._hermes_systemd_env_file = env_file
+    return proc
 
 
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
@@ -380,6 +517,7 @@ class LocalEnvironment(BaseEnvironment):
     """
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
+        self._systemd_env_files: list[str] = []
         if cwd:
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
@@ -471,7 +609,7 @@ class LocalEnvironment(BaseEnvironment):
         if _IS_WINDOWS and _popen_cwd and re.match(r'^/[a-zA-Z]/', _popen_cwd):
             _popen_cwd = _popen_cwd[1].upper() + ':' + _popen_cwd[2:].replace('/', '\\')
 
-        proc = subprocess.Popen(
+        proc = _popen_maybe_systemd_run(
             args,
             text=True,
             env=run_env,
@@ -482,12 +620,16 @@ class LocalEnvironment(BaseEnvironment):
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
             cwd=_popen_cwd,
+            unit_prefix="hermes-tool",
         )
-        if not _IS_WINDOWS:
+        if not _IS_WINDOWS and not getattr(proc, "_hermes_systemd_unit", None):
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
             except ProcessLookupError:
                 pass
+        env_file = getattr(proc, "_hermes_systemd_env_file", None)
+        if env_file:
+            self._systemd_env_files.append(env_file)
 
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
@@ -527,6 +669,18 @@ class LocalEnvironment(BaseEnvironment):
             return not _group_alive(pgid)
 
         try:
+            systemd_unit = getattr(proc, "_hermes_systemd_unit", None)
+            if systemd_unit:
+                _kill_systemd_unit(systemd_unit, escalate=True)
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return
             if _IS_WINDOWS:
                 proc.terminate()
             else:
@@ -572,6 +726,12 @@ class LocalEnvironment(BaseEnvironment):
         file, and propagating it would re-wedge the next ``Popen``.  The
         ``_run_bash`` recovery path will resolve a safe fallback if needed.
         """
+        while self._systemd_env_files:
+            env_file = self._systemd_env_files.pop(0)
+            try:
+                os.unlink(env_file)
+            except OSError:
+                pass
         try:
             with open(self._cwd_file, encoding="utf-8") as f:
                 cwd_path = f.read().strip()
@@ -585,6 +745,12 @@ class LocalEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Clean up temp files."""
+        for env_file in getattr(self, "_systemd_env_files", []):
+            try:
+                os.unlink(env_file)
+            except OSError:
+                pass
+        self._systemd_env_files = []
         for f in (self._snapshot_path, self._cwd_file):
             try:
                 os.unlink(f)

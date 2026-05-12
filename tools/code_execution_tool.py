@@ -1112,6 +1112,7 @@ def execute_code(
     tool_call_counter = [0]  # mutable so the RPC thread can increment
     exec_start = time.monotonic()
     server_sock = None
+    proc = None
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1230,7 +1231,9 @@ def execute_code(
         _child_cwd = _resolve_child_cwd(_mode, tmpdir)
         _script_path = os.path.join(tmpdir, "script.py")
 
-        proc = subprocess.Popen(
+        from tools.environments.local import _popen_maybe_systemd_run
+
+        proc = _popen_maybe_systemd_run(
             [_child_python, _script_path],
             cwd=_child_cwd,
             env=child_env,
@@ -1238,6 +1241,7 @@ def execute_code(
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
+            unit_prefix="hermes-code",
         )
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
@@ -1432,7 +1436,13 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
-        # Cleanup temp dir and socket
+        # Cleanup temp dir, socket, and transient systemd env file.
+        if proc is not None:
+            try:
+                from tools.environments.local import _cleanup_systemd_run_proc
+                _cleanup_systemd_run_proc(proc)
+            except Exception:
+                pass
         if server_sock is not None:
             try:
                 server_sock.close()
@@ -1451,6 +1461,11 @@ def execute_code(
 
 def _kill_process_group(proc, escalate: bool = False):
     """Kill the child and its entire process tree (cross-platform via psutil)."""
+    try:
+        from tools.environments.local import _kill_systemd_unit
+        _kill_systemd_unit(getattr(proc, "_hermes_systemd_unit", None), escalate=escalate)
+    except Exception:
+        pass
     import psutil
     try:
         parent = psutil.Process(proc.pid)
