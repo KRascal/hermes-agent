@@ -108,6 +108,8 @@ class GoalState:
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
+    goal_version: int = 0                     # workspace manifest version at set-time
+    manifest_scope: Optional[str] = None      # goal_orchestration scope slug
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -126,6 +128,8 @@ class GoalState:
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
+            goal_version=int(data.get("goal_version", 0) or 0),
+            manifest_scope=data.get("manifest_scope"),
         )
 
 
@@ -419,6 +423,18 @@ class GoalManager:
             created_at=time.time(),
             last_turn_at=0.0,
         )
+        # Best-effort workspace-level coordination: every new /goal bumps a
+        # manifest goal_version so older autonomous runs can detect that they
+        # are stale before committing/building/deploying. This must not make
+        # /goal unusable if the filesystem guard is unavailable.
+        try:
+            from hermes_cli.goal_orchestration import sync_goal_manifest
+
+            manifest = sync_goal_manifest(goal, session_id=self.session_id)
+            state.goal_version = int(manifest.get("goal_version", 0) or 0)
+            state.manifest_scope = manifest.get("scope")
+        except Exception as exc:  # pragma: no cover - defensive degraded mode
+            logger.debug("GoalManager: goal orchestration manifest sync failed: %s", exc)
         self._state = state
         save_goal(self.session_id, state)
         return state
@@ -578,7 +594,21 @@ class GoalManager:
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        if self._state.manifest_scope and self._state.goal_version:
+            try:
+                from hermes_cli.goal_orchestration import continuation_guard_text, read_manifest
+
+                manifest = read_manifest(self._state.manifest_scope)
+                # Freeze the run's original goal_version into the prompt. The
+                # manifest may already have advanced; in that case the guard
+                # still tells the agent exactly what to compare against.
+                manifest = dict(manifest)
+                manifest["goal_version"] = self._state.goal_version
+                prompt += continuation_guard_text(manifest)
+            except Exception as exc:  # pragma: no cover - defensive degraded mode
+                logger.debug("GoalManager: continuation guard unavailable: %s", exc)
+        return prompt
 
 
 __all__ = [
