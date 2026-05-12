@@ -191,6 +191,27 @@ class TestWebServerEndpoints:
         assert resp.json()["gateway_state"] == "startup_failed"
         assert resp.json()["gateway_platforms"] == {}
 
+    def test_get_status_includes_goal_orchestration_summary(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.goal_orchestration import register_run, sync_goal_manifest
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(repo))
+        manifest = sync_goal_manifest("protect latest instruction", session_id="sid-1", cwd=repo)
+        register_run(manifest["scope"], run_id="writer-1", role="writer")
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        summary = resp.json()["goal_orchestration"]
+        assert summary["enabled"] is True
+        assert summary["current_scope"] == manifest["scope"]
+        assert summary["current_goal_version"] == 1
+        assert summary["active_writer_run_id"] == "writer-1"
+        assert summary["scopes"][0]["current_goal"] == "protect latest instruction"
+
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")
         assert resp.status_code == 200

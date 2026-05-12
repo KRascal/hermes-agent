@@ -2386,3 +2386,39 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestGoalGuardPrompt:
+    def test_attach_goal_guard_to_prompt_registers_writer_for_workdir(self, tmp_path, monkeypatch):
+        import cron.scheduler as sched
+        from hermes_cli.goal_orchestration import check_run_current, sync_goal_manifest
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        manifest = sync_goal_manifest("cron must not overwrite newer goal", session_id="sid-1", cwd=repo)
+
+        prompt, guard = sched._attach_goal_guard_to_prompt(
+            "do the scheduled maintenance",
+            {"id": "job-1", "name": "Guarded", "workdir": str(repo)},
+        )
+
+        assert guard is not None
+        assert guard["scope"] == manifest["scope"]
+        assert guard["run_id"].startswith("cron-job-1-")
+        assert "Single Writer" in prompt
+        assert "check-run" in prompt
+        assert check_run_current(guard["scope"], guard["run_id"])["current"] is True
+
+    def test_attach_goal_guard_to_prompt_noops_without_manifest(self, tmp_path):
+        import cron.scheduler as sched
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        prompt, guard = sched._attach_goal_guard_to_prompt(
+            "do the scheduled maintenance",
+            {"id": "job-1", "name": "Guarded", "workdir": str(repo)},
+        )
+
+        assert prompt == "do the scheduled maintenance"
+        assert guard is None

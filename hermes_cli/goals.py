@@ -110,6 +110,7 @@ class GoalState:
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     goal_version: int = 0                     # workspace manifest version at set-time
     manifest_scope: Optional[str] = None      # goal_orchestration scope slug
+    run_id: Optional[str] = None              # registered writer run id for this goal
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -130,6 +131,7 @@ class GoalState:
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             goal_version=int(data.get("goal_version", 0) or 0),
             manifest_scope=data.get("manifest_scope"),
+            run_id=data.get("run_id"),
         )
 
 
@@ -428,11 +430,19 @@ class GoalManager:
         # are stale before committing/building/deploying. This must not make
         # /goal unusable if the filesystem guard is unavailable.
         try:
-            from hermes_cli.goal_orchestration import sync_goal_manifest
+            from hermes_cli.goal_orchestration import (
+                register_run,
+                session_writer_run_id,
+                sync_goal_manifest,
+            )
 
             manifest = sync_goal_manifest(goal, session_id=self.session_id)
             state.goal_version = int(manifest.get("goal_version", 0) or 0)
             state.manifest_scope = manifest.get("scope")
+            if state.manifest_scope:
+                run_id = session_writer_run_id(self.session_id)
+                register_run(state.manifest_scope, run_id=run_id, role="writer")
+                state.run_id = run_id
         except Exception as exc:  # pragma: no cover - defensive degraded mode
             logger.debug("GoalManager: goal orchestration manifest sync failed: %s", exc)
         self._state = state
@@ -605,6 +615,9 @@ class GoalManager:
                 # still tells the agent exactly what to compare against.
                 manifest = dict(manifest)
                 manifest["goal_version"] = self._state.goal_version
+                if self._state.run_id:
+                    manifest["run_id"] = self._state.run_id
+                    manifest["active_writer_run_id"] = self._state.run_id
                 prompt += continuation_guard_text(manifest)
             except Exception as exc:  # pragma: no cover - defensive degraded mode
                 logger.debug("GoalManager: continuation guard unavailable: %s", exc)

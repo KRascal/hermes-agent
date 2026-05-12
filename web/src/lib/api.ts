@@ -363,6 +363,32 @@ export interface PlatformStatus {
   updated_at: string;
 }
 
+export interface GoalOrchestrationScope {
+  scope: string;
+  repo_path?: string | null;
+  current_goal?: string | null;
+  current_goal_version?: number | null;
+  updated_at?: number | null;
+  active_writer_run_id?: string | null;
+  active_runs?: number;
+  writer_runs?: number;
+  read_only_runs?: number;
+  stale_runs?: number;
+}
+
+export interface GoalOrchestrationStatus {
+  enabled: boolean;
+  current_scope?: string | null;
+  current_goal_version?: number | null;
+  current_goal?: string | null;
+  active_writer_run_id?: string | null;
+  active_runs?: number;
+  stale_runs?: number;
+  read_only_runs?: number;
+  scopes?: GoalOrchestrationScope[];
+  error?: string;
+}
+
 export interface StatusResponse {
   active_sessions: number;
   config_path: string;
@@ -375,6 +401,7 @@ export interface StatusResponse {
   gateway_running: boolean;
   gateway_state: string | null;
   gateway_updated_at: string | null;
+  goal_orchestration?: GoalOrchestrationStatus;
   hermes_home: string;
   latest_config_version: number;
   release_date: string;

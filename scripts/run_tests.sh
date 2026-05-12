@@ -103,6 +103,25 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
   fi
 fi
 
+# ── Goal-versioned single-writer guard ──────────────────────────────────────
+# When an autonomous writer exports HERMES_GOAL_SCOPE/HERMES_GOAL_RUN_ID, this
+# runner refuses to start or report a green build if a newer /goal superseded
+# the run. This prevents stale builds from giving confidence to old code paths.
+run_goal_guard_check() {
+  local phase="$1"
+  if [ -z "${HERMES_GOAL_SCOPE:-}" ] && [ -z "${HERMES_GOAL_RUN_ID:-}" ]; then
+    return 0
+  fi
+  if [ -z "${HERMES_GOAL_SCOPE:-}" ] || [ -z "${HERMES_GOAL_RUN_ID:-}" ]; then
+    echo "error: incomplete goal guard env during $phase; set both HERMES_GOAL_SCOPE and HERMES_GOAL_RUN_ID" >&2
+    return 2
+  fi
+  echo "▶ run_goal_guard_check $phase: $HERMES_GOAL_SCOPE / $HERMES_GOAL_RUN_ID"
+  "$PYTHON" -m hermes_cli.goal_orchestration check-run "$HERMES_GOAL_SCOPE" "$HERMES_GOAL_RUN_ID" >/dev/null
+}
+
+run_goal_guard_check pre-pytest
+
 # ── Worker count ────────────────────────────────────────────────────────────
 # CI uses `-n auto` on ubuntu-latest which gives 4 workers. A 20-core
 # workstation with `-n auto` gets 20 workers and exposes test-ordering
@@ -120,10 +139,16 @@ echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
 
 # -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
-exec "$PYTHON" -m pytest \
+set +e
+"$PYTHON" -m pytest \
   -o "addopts=" \
   -n "$WORKERS" \
   --ignore=tests/integration \
   --ignore=tests/e2e \
   -m "not integration" \
   "${ARGS[@]}"
+pytest_status=$?
+set -e
+
+run_goal_guard_check post-pytest
+exit "$pytest_status"

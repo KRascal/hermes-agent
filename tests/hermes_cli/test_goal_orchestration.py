@@ -191,11 +191,42 @@ def test_goal_manager_sets_manifest_version_and_guard_prompt(hermes_home, tmp_pa
     assert state.goal_version == 1
     assert state.manifest_scope
 
+    assert state.run_id
+
     prompt = mgr.next_continuation_prompt()
     assert "Goal version: 1" in prompt
+    assert f"Run ID: {state.run_id}" in prompt
     assert "Single Writer" in prompt
     assert "stale" in prompt.lower()
+    assert "check-run" in prompt
 
     raw = (hermes_home / "state" / "goal_orchestration" / state.manifest_scope / "manifest.json").read_text()
     manifest = json.loads(raw)
     assert manifest["current_goal"] == "finish without regressions"
+    assert manifest["active_writer_run_id"] == state.run_id
+
+
+def test_goal_orchestration_status_summarizes_active_and_stale_runs(hermes_home, tmp_path):
+    from hermes_cli.goal_orchestration import (
+        current_goal_orchestration_status,
+        register_run,
+        sync_goal_manifest,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest = sync_goal_manifest("ship guarded builds", session_id="sid-1", cwd=repo)
+    register_run(manifest["scope"], run_id="writer-1", role="writer")
+    register_run(manifest["scope"], run_id="reviewer-1", role="read-only")
+    sync_goal_manifest("newer guarded goal", session_id="sid-2", cwd=repo)
+
+    status = current_goal_orchestration_status(cwd=repo)
+
+    assert status["enabled"] is True
+    assert status["current_scope"] == manifest["scope"]
+    assert status["active_writer_run_id"] is None
+    assert status["current_goal_version"] == 2
+    assert status["stale_runs"] == 1
+    assert status["read_only_runs"] == 1
+    assert status["scopes"][0]["scope"] == manifest["scope"]
+    assert status["scopes"][0]["current_goal"] == "newer guarded goal"

@@ -1009,6 +1009,50 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
     return assembled
 
 
+def _attach_goal_guard_to_prompt(prompt: str, job: dict) -> tuple[str, dict | None]:
+    """Attach a goal-version guard for workdir cron jobs when a manifest exists.
+
+    Jobs without a workdir or without an active manifest keep historical
+    behavior. Workdir jobs are already serialized by ``tick()``, so the
+    temporary process env exported below is safe for the scheduler path.
+    """
+
+    workdir = (job.get("workdir") or "").strip()
+    if not workdir or not Path(workdir).is_dir():
+        return prompt, None
+    try:
+        from hermes_cli.goal_orchestration import (
+            continuation_guard_text,
+            cron_writer_run_id,
+            read_manifest,
+            register_run,
+            scope_for_cwd,
+        )
+
+        scope = scope_for_cwd(workdir)
+        manifest = read_manifest(scope)
+        if not manifest or not manifest.get("goal_version"):
+            return prompt, None
+        run_id = cron_writer_run_id(str(job.get("id") or "job"))
+        run = register_run(scope, run_id=run_id, role="writer", paths=[workdir])
+        guarded_manifest = dict(manifest)
+        guarded_manifest["run_id"] = run_id
+        guarded_manifest["active_writer_run_id"] = run_id
+        guard = {
+            "scope": scope,
+            "run_id": run_id,
+            "goal_version": int(run.get("goal_version", manifest.get("goal_version") or 0)),
+        }
+        return prompt + continuation_guard_text(guarded_manifest), guard
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': goal guard attach skipped: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        return prompt, None
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1189,6 +1233,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    prompt, _goal_guard = _attach_goal_guard_to_prompt(prompt, job)
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -1196,6 +1241,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _goal_guard_env = {
+        "HERMES_GOAL_SCOPE": str((_goal_guard or {}).get("scope") or ""),
+        "HERMES_GOAL_RUN_ID": str((_goal_guard or {}).get("run_id") or ""),
+        "HERMES_GOAL_VERSION": str((_goal_guard or {}).get("goal_version") or ""),
+    } if _goal_guard else {}
+    _prior_goal_guard_env = {key: os.environ.get(key, "_UNSET_") for key in _goal_guard_env}
+    for key, value in _goal_guard_env.items():
+        if value:
+            os.environ[key] = value
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -1514,6 +1568,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
+        if _goal_guard:
+            try:
+                from hermes_cli.goal_orchestration import check_run_current
+
+                _guard_status = check_run_current(_goal_guard["scope"], _goal_guard["run_id"])
+            except Exception as _guard_exc:
+                raise RuntimeError(f"goal guard check failed: {_guard_exc}") from _guard_exc
+            if not _guard_status.get("current"):
+                raise RuntimeError(f"goal guard stale before completion: {_guard_status}")
+
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
             _activity = {}
@@ -1613,6 +1677,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return False, output, "", error_msg
 
     finally:
+        for _key, _prior in locals().get("_prior_goal_guard_env", {}).items():
+            if _prior == "_UNSET_":
+                os.environ.pop(_key, None)
+            else:
+                os.environ[_key] = _prior
+        if locals().get("_goal_guard"):
+            try:
+                from hermes_cli.goal_orchestration import complete_run
+
+                _status = "completed" if "error_msg" not in locals() else "failed"
+                complete_run(_goal_guard["scope"], _goal_guard["run_id"], status=_status)
+            except Exception as _guard_done_exc:
+                logger.debug("Job '%s': failed to complete goal guard run: %s", job_id, _guard_done_exc)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.

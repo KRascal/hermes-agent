@@ -621,6 +621,13 @@ async def get_status():
     except Exception:
         pass
 
+    try:
+        from hermes_cli.goal_orchestration import current_goal_orchestration_status
+
+        goal_orchestration = current_goal_orchestration_status()
+    except Exception as exc:
+        goal_orchestration = {"enabled": False, "error": str(exc)}
+
     return {
         "version": __version__,
         "release_date": __release_date__,
@@ -637,6 +644,7 @@ async def get_status():
         "gateway_exit_reason": gateway_exit_reason,
         "gateway_updated_at": gateway_updated_at,
         "active_sessions": active_sessions,
+        "goal_orchestration": goal_orchestration,
     }
 
 

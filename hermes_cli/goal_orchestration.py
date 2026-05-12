@@ -119,6 +119,27 @@ def _validate_run_id(run_id: str) -> str:
     return run_id
 
 
+def _run_id_slug(value: str, *, max_length: int = 56) -> str:
+    slug = _clean_slug(value or "run", max_length=max_length)
+    return slug if slug and slug[0].isalnum() else f"run-{slug}"
+
+
+def session_writer_run_id(session_id: str) -> str:
+    """Stable writer run id for a live /goal session."""
+
+    digest = hashlib.sha1((session_id or "session").encode("utf-8")).hexdigest()[:10]
+    slug = _run_id_slug(session_id or "session", max_length=42)
+    return _validate_run_id(f"goal_{slug}_{digest}"[:80])
+
+
+def cron_writer_run_id(job_id: str) -> str:
+    """Unique-enough writer run id for one cron tick."""
+
+    slug = _run_id_slug(job_id or "job", max_length=36)
+    stamp = int(_now() * 1000)
+    return _validate_run_id(f"cron-{slug}-{stamp}"[:80])
+
+
 @contextmanager
 def _locked_scope(scope: str) -> Iterator[Path]:
     directory = scope_dir(scope)
@@ -419,10 +440,14 @@ def continuation_guard_text(manifest: dict[str, Any]) -> str:
 
     scope = manifest.get("scope") or "unknown"
     version = manifest.get("goal_version") or 0
+    run_id = manifest.get("run_id") or manifest.get("active_writer_run_id") or "unregistered"
     return (
         "\n\n[Goal-Versioned Single Writer Guard]\n"
         f"Scope: {scope}\n"
         f"Goal version: {version}\n"
+        f"Run ID: {run_id}\n"
+        f"Guard command: python -m hermes_cli.goal_orchestration check-run {scope} {run_id}\n"
+        f"Runner env: HERMES_GOAL_SCOPE={scope} HERMES_GOAL_RUN_ID={run_id} HERMES_GOAL_VERSION={version}\n"
         "Single Writer policy is active. Parallel scouts/reviewers are allowed, "
         "but only one writer may modify canonical files/branches. Before commit, "
         "build, push, deploy, or completion report, re-read the goal manifest and "
@@ -432,15 +457,83 @@ def continuation_guard_text(manifest: dict[str, Any]) -> str:
     )
 
 
-def manifest_status_markdown(scope: str) -> str:
-    manifest = read_manifest(scope)
+def _scope_summary(scope: str) -> dict[str, Any]:
     directory = scope_dir(scope)
+    manifest = _load_json(directory / "manifest.json")
     locks = _load_json(_locks_path(directory), {"active_writer_run_id": None})
+    runs: list[dict[str, Any]] = []
+    runs_dir = directory / "runs"
+    if runs_dir.exists():
+        for path in sorted(runs_dir.glob("*.json")):
+            try:
+                run = _load_json(path)
+            except GoalOrchestrationError:
+                continue
+            if run:
+                runs.append(run)
+    active_runs = [r for r in runs if r.get("status") == "active"]
+    stale_runs = [r for r in runs if r.get("status") == "stale"]
+    read_only_runs = [r for r in runs if r.get("role") == "read-only"]
+    writer_runs = [r for r in runs if r.get("role") == "writer"]
+    return {
+        "scope": scope,
+        "repo_path": manifest.get("repo_path"),
+        "current_goal": manifest.get("current_goal"),
+        "current_goal_version": int(manifest.get("goal_version", 0) or 0),
+        "updated_at": manifest.get("updated_at"),
+        "active_writer_run_id": locks.get("active_writer_run_id") or manifest.get("active_writer_run_id"),
+        "active_runs": len(active_runs),
+        "writer_runs": len(writer_runs),
+        "read_only_runs": len(read_only_runs),
+        "stale_runs": len(stale_runs),
+        "runs": runs,
+    }
+
+
+def current_goal_orchestration_status(
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Dashboard-friendly summary of goal-versioned single-writer state."""
+
+    current_scope = scope_for_cwd(cwd)
+    root = state_root()
+    summaries: list[dict[str, Any]] = []
+    if root.exists():
+        for directory in root.iterdir():
+            if not directory.is_dir() or not (directory / "manifest.json").exists():
+                continue
+            try:
+                summaries.append(_scope_summary(directory.name))
+            except (GoalOrchestrationError, ValueError, OSError):
+                continue
+    summaries.sort(key=lambda s: float(s.get("updated_at") or 0), reverse=True)
+    selected = next((s for s in summaries if s.get("scope") == current_scope), None)
+    if selected is None and summaries:
+        selected = summaries[0]
+    return {
+        "enabled": True,
+        "current_scope": current_scope,
+        "current_goal_version": selected.get("current_goal_version") if selected else None,
+        "current_goal": selected.get("current_goal") if selected else None,
+        "active_writer_run_id": selected.get("active_writer_run_id") if selected else None,
+        "active_runs": sum(int(s.get("active_runs") or 0) for s in summaries),
+        "stale_runs": sum(int(s.get("stale_runs") or 0) for s in summaries),
+        "read_only_runs": sum(int(s.get("read_only_runs") or 0) for s in summaries),
+        "scopes": summaries[: max(1, int(limit or 20))],
+    }
+
+
+def manifest_status_markdown(scope: str) -> str:
+    summary = _scope_summary(scope)
     return (
         f"# Goal orchestration status — {scope}\n\n"
-        f"- Goal version: {manifest.get('goal_version')}\n"
-        f"- Active writer: {locks.get('active_writer_run_id') or 'none'}\n"
-        f"- Goal: {manifest.get('current_goal')}\n"
+        f"- Goal version: {summary.get('current_goal_version')}\n"
+        f"- Active writer: {summary.get('active_writer_run_id') or 'none'}\n"
+        f"- Active runs: {summary.get('active_runs')}\n"
+        f"- Stale runs: {summary.get('stale_runs')}\n"
+        f"- Goal: {summary.get('current_goal')}\n"
     )
 
 

@@ -591,6 +591,8 @@ export default function SessionsPage() {
   const recentSessions = overviewSessions
     .filter((s) => !s.is_active)
     .slice(0, 5);
+  const goalOrchestration = status?.goal_orchestration;
+  const currentGoalScope = goalOrchestration?.scopes?.[0];
 
   const alerts: { message: string; detail?: string }[] = [];
   if (status) {
@@ -729,6 +731,84 @@ export default function SessionsPage() {
 
       {platformEntries.length > 0 && status && (
         <PlatformsCard platforms={platformEntries} />
+      )}
+
+      {goalOrchestration?.enabled && currentGoalScope && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <CheckCircle2 className="h-5 w-5 text-success shrink-0" />
+                <CardTitle className="text-base truncate">
+                  Goal-Versioned Single Writer
+                </CardTitle>
+              </div>
+              <Badge
+                tone={
+                  goalOrchestration.active_writer_run_id
+                    ? "success"
+                    : goalOrchestration.stale_runs
+                      ? "warning"
+                      : "outline"
+                }
+                className="text-[10px] shrink-0"
+              >
+                {goalOrchestration.active_writer_run_id
+                  ? "writer locked"
+                  : goalOrchestration.stale_runs
+                    ? "stale runs"
+                    : "idle"}
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-3 text-sm">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              <div className="border border-border p-2">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                  version
+                </div>
+                <div className="font-mono-ui text-foreground">
+                  {goalOrchestration.current_goal_version ?? "—"}
+                </div>
+              </div>
+              <div className="border border-border p-2">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                  writer
+                </div>
+                <div className="font-mono-ui text-foreground truncate">
+                  {goalOrchestration.active_writer_run_id ?? "none"}
+                </div>
+              </div>
+              <div className="border border-border p-2">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                  readers
+                </div>
+                <div className="font-mono-ui text-foreground">
+                  {goalOrchestration.read_only_runs ?? 0}
+                </div>
+              </div>
+              <div className="border border-border p-2">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                  stale
+                </div>
+                <div className="font-mono-ui text-foreground">
+                  {goalOrchestration.stale_runs ?? 0}
+                </div>
+              </div>
+            </div>
+            <div className="border border-border p-3">
+              <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground mb-1">
+                current goal
+              </div>
+              <div className="text-foreground whitespace-pre-wrap">
+                {goalOrchestration.current_goal ?? currentGoalScope.current_goal}
+              </div>
+              <div className="mt-2 text-xs text-muted-foreground font-mono-ui truncate">
+                {currentGoalScope.scope}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {recentSessions.length > 0 && (
