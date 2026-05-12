@@ -2147,6 +2147,30 @@ class GatewayRunner:
         except Exception:
             pass
 
+    async def _runtime_status_heartbeat(self, interval: float = 30.0) -> None:
+        """Keep gateway_state.json fresh while the gateway is healthy and idle."""
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._running:
+                break
+            try:
+                from gateway.status import write_runtime_status
+                write_runtime_status(
+                    restart_requested=self._restart_requested,
+                    active_agents=self._running_agent_count(),
+                )
+            except Exception as exc:
+                logger.debug("Runtime status heartbeat failed: %s", exc, exc_info=True)
+
+    def _schedule_runtime_status_heartbeat(self) -> None:
+        task = getattr(self, "_runtime_status_heartbeat_task", None)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._runtime_status_heartbeat())
+        self._runtime_status_heartbeat_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     @staticmethod
     def _load_prefill_messages() -> List[Dict[str, Any]]:
         """Load ephemeral prefill messages from config or env var.
@@ -3683,6 +3707,7 @@ class GatewayRunner:
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher to finalize expired sessions
+        self._schedule_runtime_status_heartbeat()
         asyncio.create_task(self._session_expiry_watcher())
 
         # Start background kanban notifier — delivers `completed`, `blocked`,

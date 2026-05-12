@@ -165,6 +165,39 @@ async def test_drain_active_agents_throttles_status_updates():
 
 
 @pytest.mark.asyncio
+async def test_runtime_status_heartbeat_refreshes_status_without_clobbering_state():
+    runner, _adapter = make_restart_runner()
+    runner._running = True
+    runner._restart_requested = False
+    runner._running_agents = {"session": MagicMock()}
+    calls = []
+
+    def fake_write_runtime_status(**kwargs):
+        calls.append(kwargs)
+        runner._running = False
+
+    with patch("gateway.status.write_runtime_status", side_effect=fake_write_runtime_status):
+        await runner._runtime_status_heartbeat(interval=0)
+
+    assert calls == [{"restart_requested": False, "active_agents": 1}]
+    assert "gateway_state" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_schedule_runtime_status_heartbeat_tracks_single_background_task():
+    runner, _adapter = make_restart_runner()
+    runner._runtime_status_heartbeat = AsyncMock()
+
+    runner._schedule_runtime_status_heartbeat()
+    first_task = runner._runtime_status_heartbeat_task
+    runner._schedule_runtime_status_heartbeat()
+
+    assert runner._runtime_status_heartbeat_task is first_task
+    assert first_task in runner._background_tasks
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on_timeout(monkeypatch):
     """On drain timeout, tool subprocesses must be killed BEFORE adapter
     disconnect so systemd's TimeoutStopSec doesn't SIGKILL the cgroup with
